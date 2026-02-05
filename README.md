@@ -1,15 +1,29 @@
-# GPU Benchmark GoEmotions
+## Encoder Optimizations with ONNX
 
-GPU and CPU Benchmark of the [`SamLowe/roberta-base-go_emotions`](https://huggingface.co/SamLowe/roberta-base-go_emotions) model on a dataset of 10k random reddit comments, with pytorch ([`torch`](https://huggingface.co/SamLowe/roberta-base-go_emotions)), ONNX ([`onnx`](https://huggingface.co/SamLowe/roberta-base-go_emotions-onnx)), and O4-optimized FP16 ONNX versions ([`onnx-fp16`](https://huggingface.co/joaopn/roberta-base-go_emotions-onnx-fp16)). 
+Many transformers encoder-type models (e.g. `BERT`-based), can have 2-3X performance gains by being converted to the [ONNX](https://onnx.ai/) format, more precisely to FP16-quantized version. Often, this has no accuracy penalty and it is a free performance gain. This repo has scripts to convert and benchmark models.
 
-## Results
-GPU insights:
-- The FP16 optimized model is up to **3X** faster than torch. The gain depends on the GPU's specific FP32:FP16 ratio.
-- Base ONNX with CUDA is up to ~40% faster than torch. In theory, it can be optimized further with [TensorRT](https://huggingface.co/docs/optimum/onnxruntime/usage_guides/gpu#tensorrtexecutionprovider).
-- The RTX 4090 is both 9X faster and 9X more expensive than the P40 (~$1800 vs ~$200 used) with FP16 ONNX, and only 4-5X faster with the other models.
+#### Requirements
 
+ONNX with CUDA requires a working `torch` installation with CUDA support, as well as `transformers`, `optimum`, `pandas` and `tqdm`. These can be installed with
 
-### Benchmark results
+```
+pip install transformers optimum[onnxruntime-gpu] pandas tqdm --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+```
+
+Alternatively, a conda environment `bench` with all the requirements can be created with
+
+```
+conda env create -f environment.yml
+conda activate bench
+```
+
+## Benchmark
+
+GPU Benchmark of the [`SamLowe/roberta-base-go_emotions`](https://huggingface.co/SamLowe/roberta-base-go_emotions) model on a dataset of 10k random reddit comments, with pytorch ([`torch`](https://huggingface.co/SamLowe/roberta-base-go_emotions)), ONNX ([`onnx`](https://huggingface.co/SamLowe/roberta-base-go_emotions-onnx)), and O4-optimized FP16 ONNX versions ([`onnx-fp16`](https://huggingface.co/joaopn/roberta-base-go_emotions-onnx-fp16)). 
+
+### Results
+- The ONNX FP16 optimized model is up to **3X** faster than torch. The gain depends chiefly on bandwidth and FP32:FP16 ratio
+- Base ONNX is up to ~40% faster than torch
 
 <details open>
 
@@ -61,52 +75,14 @@ GPU insights:
 **Table 2:** GPU benchmark in messages/s for the filtered dataset. Results may vary due to CPU tokenizer performance.
 </details>
 
-<details>
-<summary>CPU results for the normal dataset</summary>
-
-| CPU/batch size @threads    |   1 @1T  | 2 @1T | 4 @1T | 1 @4T | 2 @4T | 4 @4T | @max cores* |
-|----------------------------|:--------:|:-----:|:-----:|:-----:|:-----:|:-----:|:-----------:|
-|      |  |   |   |   |   |   |        |
-
-
-**Table 3:** CPU benchmark in **messages/thread/s**. *(@max cores) = (performance @1T)x(number of cores). It underestimates performance by disregarding hyperthreading, but overestimates by assuming same frequency at single-threaded and full load. 
-</details>
-
-<details>
-<summary>CPU results for the filtered dataset</summary>
-
-| CPU/batch size @threads    |   1 @1T  | 2 @1T | 4 @1T | 1 @4T | 2 @4T | 4 @4T | @max cores* |
-|----------------------------|:--------:|:-----:|:-----:|:-----:|:-----:|:-----:|:-----------:|
-|      |  |   |   |   |   |   |        |
-
-
-**Table 4:** CPU benchmark in **messages/thread/s**. *(@max cores) = (performance @1T)x(number of cores). It underestimates performance by disregarding hyperthreading, but overestimates by assuming same frequency at single-threaded and full load. 
-</details>
-
-## Documentation
-
-### Requirements
-
-The benchmark requires a working `torch` installation with CUDA support, as well as `transformers`, `optimum`, `pandas` and `tqdm`. These can be installed with
-
-```
-pip install transformers optimum[onnxruntime-gpu] pandas tqdm --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
-```
-
-Alternatively, a conda environment `bench` with all the requirements can be created with
-
-```
-conda env create -f environment.yml
-conda activate bench
-```
-### Dataset
+#### Dataset
 
 The dataset consists of 10K randomly sampled Reddit comments from 12/2005-03/2023, from the [Pushshift data dumps](https://academictorrents.com/details/9c263fc85366c1ef8f5bb9da0203f4c8c8db75f4). It excludes comments with empty, `[deleted]` or `[removed]` content. Two options are provided:
 - `normal`: As described above
 - `filtered`: contains only comments with `>200` characters. 
 
 
-### Usage
+#### Usage
 
 To run the benchmarks, use the `run_benchmark.py` script:
 
@@ -124,3 +100,25 @@ Arguments:
 
 
 The scripts will output the number of messages processed per second for each batch size.
+
+## Model Export
+
+To export and optimize a HuggingFace model to ONNX FP16 format, use the `export_onnx.py` script:
+
+```
+python export_onnx.py <model_id> [OPTIONS]
+```
+
+This script:
+1. Exports a HuggingFace model to ONNX with FP16 optimization (O4 config)
+2. Benchmarks it against the original PyTorch model on 10k Reddit comments
+3. Generates a README with accuracy statistics
+4. Optionally uploads the optimized model to HuggingFace Hub
+
+Arguments:
+- `model_id` (required): HuggingFace model ID (e.g., "SamLowe/roberta-base-go_emotions")
+- `--save-dir`: Directory to save the optimized model (default: "./{model_name}-onnx-fp16")
+- `--batch-size`: Batch size for benchmarking (default: 1)
+- `--hf-token`: HuggingFace API token for upload
+- `--no-upload`: Skip the upload prompt and don't upload to HuggingFace
+- `--disable-shape-inference`: Disable shape inference during optimization (recommended for very large models)
