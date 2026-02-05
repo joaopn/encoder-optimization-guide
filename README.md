@@ -17,6 +17,8 @@ conda env create -f environment.yml
 conda activate bench
 ```
 
+A collection of ready-to-use ONNX-FP16 encoder models can be found here: https://huggingface.co/collections/joaopn/onnx-fp16
+
 ## Benchmark
 
 GPU Benchmark of the [`SamLowe/roberta-base-go_emotions`](https://huggingface.co/SamLowe/roberta-base-go_emotions) model on a dataset of 10k random reddit comments, with pytorch ([`torch`](https://huggingface.co/SamLowe/roberta-base-go_emotions)), ONNX ([`onnx`](https://huggingface.co/SamLowe/roberta-base-go_emotions-onnx)), and O4-optimized FP16 ONNX versions ([`onnx-fp16`](https://huggingface.co/joaopn/roberta-base-go_emotions-onnx-fp16)). 
