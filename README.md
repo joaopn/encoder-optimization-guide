@@ -1,6 +1,6 @@
 ## Encoder Optimizations with ONNX
 
-Many transformers encoder-type models (e.g. `BERT`-based), can have 2-3X performance gains by being converted to the [ONNX](https://onnx.ai/) format, more precisely to FP16-quantized version. Often, this has no accuracy penalty and it is a free performance gain. This repo has scripts to convert and benchmark models.
+Many transformers encoder-type models can have considerably performance gains by being converted to [ONNX](https://onnx.ai/). Some model families (`BERT`, `RoBERTa`, etc) can be further quantized to ONNX-FP16 for **2-3X performance gains** with no accuracy penalty. This repo contain scripts to convert, validate accuracy and benchmark models.
 
 #### Requirements
 
@@ -79,7 +79,7 @@ GPU Benchmark of the [`SamLowe/roberta-base-go_emotions`](https://huggingface.co
 
 #### Dataset
 
-The dataset consists of 10K randomly sampled Reddit comments from 12/2005-03/2023, from the [Pushshift data dumps](https://academictorrents.com/details/9c263fc85366c1ef8f5bb9da0203f4c8c8db75f4). It excludes comments with empty, `[deleted]` or `[removed]` content. Two options are provided:
+The dataset consists of 10k randomly sampled Reddit comments from 12/2005-03/2023, from the [Pushshift data dumps](https://academictorrents.com/details/9c263fc85366c1ef8f5bb9da0203f4c8c8db75f4). It excludes comments with empty, `[deleted]` or `[removed]` content. Two options are provided:
 - `normal`: As described above
 - `filtered`: contains only comments with `>200` characters. 
 

@@ -18,7 +18,8 @@ import onnx
 import pandas as pd
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, XLMRobertaTokenizer
+from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
 from optimum.onnxruntime import ORTModelForSequenceClassification, ORTOptimizer
 from optimum.onnxruntime.configuration import AutoOptimizationConfig
 
@@ -31,6 +32,41 @@ def get_probabilities(logits, problem_type):
         return torch.softmax(logits, dim=-1)
 
 
+def load_tokenizer(model_id):
+    """Load tokenizer, falling back to slow tokenizer if fast tokenizer fails.
+
+    Some models (e.g. cardiffnlp/twitter-xlm-roberta-base-sentiment) use
+    SentencePiece without a vocab_file, which breaks the fast tokenizer path.
+    When tokenizer_config forces the Fast class, use_fast=False is ignored;
+    we then load the slow class explicitly via TOKENIZER_MAPPING.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(model_id)
+    except (AttributeError, TypeError) as e:
+        if "vocab_file" in str(e) or "endswith" in str(e) or "NoneType" in str(e):
+            config = AutoConfig.from_pretrained(model_id)
+            if type(config) not in TOKENIZER_MAPPING:
+                raise
+            slow_class, _ = TOKENIZER_MAPPING[type(config)]
+            if slow_class is None:
+                # Some configs (e.g. XLMRobertaConfig) list only the fast tokenizer
+                config_name = type(config).__name__
+                if config_name == "XLMRobertaConfig":
+                    try:
+                        return XLMRobertaTokenizer.from_pretrained(model_id)
+                    except ImportError as ie:
+                        if "sentencepiece" in str(ie).lower():
+                            raise ImportError(
+                                "XLMRobertaTokenizer requires SentencePiece. Install it with: pip install sentencepiece"
+                            ) from ie
+                        raise
+                raise ValueError(
+                    f"No slow tokenizer for {config_name}; fast tokenizer failed."
+                ) from e
+            return slow_class.from_pretrained(model_id)
+        raise
+
+
 def export_to_onnx(model_id, save_dir, disable_shape_inference=False):
     """Export model to ONNX with FP16 optimization."""
     print(f"Exporting model '{model_id}' to ONNX...")
@@ -40,7 +76,7 @@ def export_to_onnx(model_id, save_dir, disable_shape_inference=False):
     
     # 1. Export the base model to ONNX
     model = ORTModelForSequenceClassification.from_pretrained(model_id, export=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = load_tokenizer(model_id)
 
     # 2. Setup the Optimizer
     optimizer = ORTOptimizer.from_pretrained(model)
@@ -101,8 +137,8 @@ def benchmark_model(model_id, onnx_path, batch_size=1):
     total_samples = len(df)
     print(f"Loaded {total_samples} samples.")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    
+    tokenizer = load_tokenizer(model_id)
+
     # 2. Load Models
     print("Loading PyTorch model (reference)...")
     pt_model = ORTModelForSequenceClassification.from_pretrained(model_id, export=True).to("cuda")
@@ -411,7 +447,7 @@ def main():
         "--save-dir",
         type=str,
         default=None,
-        help="Directory to save the optimized model (default: ./{model_name}-onnx-fp16)"
+        help="Directory to save the optimized model (default: models/{model_name}-onnx-fp16)"
     )
     parser.add_argument(
         "--batch-size",
@@ -438,10 +474,11 @@ def main():
     
     args = parser.parse_args()
     
-    # Set default save directory
+    # Set default save directory (under models/, created if needed)
     if args.save_dir is None:
         model_name = args.model_id.split('/')[-1]
-        args.save_dir = f"./{model_name}-onnx-fp16"
+        args.save_dir = f"models/{model_name}-onnx-fp16"
+    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     
     print("="*60)
     print("ONNX FP16 MODEL EXPORT AND BENCHMARK")
