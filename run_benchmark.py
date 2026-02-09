@@ -19,9 +19,20 @@ def load_model(device_type, model_type, model_id, file_name, gpu_id, num_threads
         device = torch.device('cpu')
         torch.set_num_threads(num_threads)
 
-    if model_type == 'torch':
+    if model_type == 'torch-base':
         model = AutoModelForSequenceClassification.from_pretrained(model_id)
         model.to(device)
+        model.eval()
+    elif model_type == 'torch':
+        model = AutoModelForSequenceClassification.from_pretrained(model_id)
+        model.to(device)
+        model.eval()
+        if device_type == 'gpu':
+            torch.set_float32_matmul_precision('high')
+            try:
+                model = torch.compile(model)
+            except Exception as e:
+                print(f"Warning: torch.compile failed ({e}), using eager mode")
     elif model_type == 'onnx':
         if device_type == 'cpu':
             model = ORTModelForSequenceClassification.from_pretrained(
@@ -61,22 +72,24 @@ def count_messages(batches):
     return sum(b['input_ids'].shape[0] for b in batches)
 
 
-def inference_loop(model, device, batches):
-    """Run inference on pre-padded batches. Only does .to(device) + forward pass."""
+def move_batches_to_device(batches, device):
+    """Move all batch tensors to device. Done before timing."""
+    return [{'input_ids': b['input_ids'].to(device),
+             'attention_mask': b['attention_mask'].to(device)} for b in batches]
+
+
+def inference_loop(model, batches):
+    """Run inference on pre-moved batches. Only does forward pass."""
     for padded in batches:
-        input_ids = padded['input_ids'].to(device)
-        attention_mask = padded['attention_mask'].to(device)
         with torch.no_grad():
-            model(input_ids, attention_mask=attention_mask)
+            model(padded['input_ids'], attention_mask=padded['attention_mask'])
 
 
-def warmup(model, device, batches):
+def warmup(model, batches):
     """Run one batch as warmup (untimed)."""
     padded = batches[0]
-    input_ids = padded['input_ids'].to(device)
-    attention_mask = padded['attention_mask'].to(device)
     with torch.no_grad():
-        model(input_ids, attention_mask=attention_mask)
+        model(padded['input_ids'], attention_mask=padded['attention_mask'])
 
 
 def worker_process(worker_id, tokenized_shard, batch_size, model_type, model_id, file_name,
@@ -88,15 +101,16 @@ def worker_process(worker_id, tokenized_shard, batch_size, model_type, model_id,
     # Pad batches inside the worker (avoids pickling tensors across processes)
     batches = prepare_batches(tokenized_shard, batch_size, tokenizer)
     n = count_messages(batches)
+    batches = move_batches_to_device(batches, device)
 
-    warmup(model, device, batches)
+    warmup(model, batches)
     if device_type == 'gpu':
         torch.cuda.synchronize(gpu_id)
 
     barrier.wait()
 
     start = time.time()
-    inference_loop(model, device, batches)
+    inference_loop(model, batches)
     if device_type == 'gpu':
         torch.cuda.synchronize(gpu_id)
     elapsed = time.time() - start
@@ -140,7 +154,7 @@ def benchmark_multi(tokenized_data, batch_size, num_workers, model_type, model_i
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark GPUs running encoder models")
     parser.add_argument("--dataset", type=str, choices=["normal", "filtered"], default="normal", help="Dataset to use (normal or filtered)")
-    parser.add_argument("--model", type=str, choices=["torch", "onnx", "onnx-fp16"], required=True, help="Model to use (torch, onnx or onnx-fp16)")
+    parser.add_argument("--model", type=str, required=True, help="Comma-separated models to run (torch, onnx, onnx-fp16)")
     parser.add_argument("--device", type=str, choices=["cpu", "gpu"], default="gpu", help="Device to use (cpu or gpu)")
     parser.add_argument("--gpu", type=int, default=0, help="GPU ID to use (default 0)")
     parser.add_argument("--batches", type=str, default="1,2,4,8,16,32", help="Comma-separated batch sizes to run")
@@ -152,16 +166,20 @@ if __name__ == "__main__":
 
     # Models
     model_ids = {
+        "torch-base": {'model_type': 'torch-base', 'model_id': "SamLowe/roberta-base-go_emotions", 'file_name': None},
         "torch": {'model_type': 'torch', 'model_id': "SamLowe/roberta-base-go_emotions", 'file_name': None},
         "onnx": {'model_type': 'onnx', 'model_id': "SamLowe/roberta-base-go_emotions-onnx", 'file_name': "onnx/model.onnx"},
         "onnx-fp16": {'model_type': 'onnx', 'model_id': "joaopn/roberta-base-go_emotions-onnx-fp16", 'file_name': "model.onnx"}
     }
 
-    if args.model == "onnx-fp16" and args.device == "cpu":
-        raise ValueError("ONNX FP16 models are only supported on GPUs")
+    models = [m.strip() for m in args.model.split(',')]
+    for m in models:
+        if m not in model_ids:
+            raise ValueError(f"Unknown model: {m}. Choose from: {', '.join(model_ids.keys())}")
+        if m == "onnx-fp16" and args.device == "cpu":
+            raise ValueError("ONNX FP16 models are only supported on GPUs")
 
     field_name = "body"
-    model_params = model_ids[args.model]
 
     if args.dataset == "filtered":
         str_dataset = 'data/random_sample_10k_filtered.csv.gz'
@@ -171,75 +189,80 @@ if __name__ == "__main__":
     df = pd.read_csv(str_dataset, compression='gzip')
     texts = df[field_name].tolist()
 
-    # Pre-tokenize dataset once
-    print("Pre-tokenizing dataset...")
-    tokenizer = AutoTokenizer.from_pretrained(model_params['model_id'])
-    tokenized_data = pre_tokenize(texts, tokenizer)
-    print(f"Pre-tokenized {len(tokenized_data)} texts")
-
     batch_sizes = [int(x) for x in args.batches.split(',')]
     worker_counts = [int(x) for x in args.workers.split(',')]
 
-    results = {}
-
-    for num_workers in worker_counts:
-        for batch_size in batch_sizes:
-            print(f"Benchmarking: workers={num_workers}, batch_size={batch_size}")
-            throughput = benchmark_multi(
-                tokenized_data, batch_size, num_workers, model_params['model_type'],
-                model_params['model_id'], model_params['file_name'],
-                args.device, args.gpu, args.threads)
-            results[(num_workers, batch_size)] = throughput
-            print(f"  -> {throughput:.2f} messages/s")
-
-    # Print summary
-    multi_worker = len(worker_counts) > 1 or worker_counts[0] != 1
-
     if args.device == 'gpu':
         gpu_name = torch.cuda.get_device_name(args.gpu)
-        header = f"Dataset: {args.dataset}, Model: {args.model}, GPU: {gpu_name}"
-    else:
-        header = f"Dataset: {args.dataset}, Model: {args.model}, CPU threads: {args.threads}"
 
-    print(f"\n{header}\n")
+    for model_name_arg in models:
+        model_params = model_ids[model_name_arg]
 
-    lines = []
-    if multi_worker:
-        if args.device == 'cpu':
-            lines.append("workers\tsize\tmessages/s\tmessages/s/thread")
-            for num_workers in worker_counts:
-                for batch_size in batch_sizes:
-                    throughput = results[(num_workers, batch_size)]
-                    lines.append(f"{num_workers}\t{batch_size}\t{throughput:.2f}\t\t{throughput/args.threads:.2f}")
-        else:
-            lines.append("workers\tsize\tmessages/s")
-            for num_workers in worker_counts:
-                for batch_size in batch_sizes:
-                    lines.append(f"{num_workers}\t{batch_size}\t{results[(num_workers, batch_size)]:.2f}")
-    else:
-        if args.device == 'cpu':
-            lines.append("size\tmessages/s\tmessages/s/thread")
+        # Pre-tokenize dataset for this model's tokenizer
+        print(f"\nPre-tokenizing dataset for {model_name_arg}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_params['model_id'])
+        tokenized_data = pre_tokenize(texts, tokenizer)
+        print(f"Pre-tokenized {len(tokenized_data)} texts")
+
+        results = {}
+
+        for num_workers in worker_counts:
             for batch_size in batch_sizes:
-                throughput = results[(1, batch_size)]
-                lines.append(f"{batch_size}\t{throughput:.2f}\t\t{throughput/args.threads:.2f}")
-        else:
-            lines.append("size\tmessages/s")
-            for batch_size in batch_sizes:
-                lines.append(f"{batch_size}\t{results[(1, batch_size)]:.2f}")
+                print(f"Benchmarking {model_name_arg}: workers={num_workers}, batch_size={batch_size}")
+                throughput = benchmark_multi(
+                    tokenized_data, batch_size, num_workers, model_params['model_type'],
+                    model_params['model_id'], model_params['file_name'],
+                    args.device, args.gpu, args.threads)
+                results[(num_workers, batch_size)] = throughput
+                print(f"  -> {throughput:.2f} messages/s")
 
-    for line in lines:
-        print(line)
+        # Print summary
+        multi_worker = len(worker_counts) > 1 or worker_counts[0] != 1
 
-    if args.save:
-        model_name = model_ids["torch"]["model_id"].split('/')[-1]
         if args.device == 'gpu':
-            device_name = gpu_name.replace(' ', '-')
+            header = f"Dataset: {args.dataset}, Model: {model_name_arg}, GPU: {gpu_name}"
         else:
-            device_name = f"cpu_{args.threads}t"
-        save_dir = f"results/{model_name}"
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = f"{save_dir}/{device_name}_{args.model}_{args.dataset}.tsv"
-        with open(save_path, 'w') as f:
-            for line in lines:
-                f.write(line + "\n")
-        print(f"\nResults saved to {save_path}")
+            header = f"Dataset: {args.dataset}, Model: {model_name_arg}, CPU threads: {args.threads}"
+
+        print(f"\n{header}\n")
+
+        lines = []
+        if multi_worker:
+            if args.device == 'cpu':
+                lines.append("workers\tsize\tmessages/s\tmessages/s/thread")
+                for num_workers in worker_counts:
+                    for batch_size in batch_sizes:
+                        throughput = results[(num_workers, batch_size)]
+                        lines.append(f"{num_workers}\t{batch_size}\t{throughput:.2f}\t\t{throughput/args.threads:.2f}")
+            else:
+                lines.append("workers\tsize\tmessages/s")
+                for num_workers in worker_counts:
+                    for batch_size in batch_sizes:
+                        lines.append(f"{num_workers}\t{batch_size}\t{results[(num_workers, batch_size)]:.2f}")
+        else:
+            if args.device == 'cpu':
+                lines.append("size\tmessages/s\tmessages/s/thread")
+                for batch_size in batch_sizes:
+                    throughput = results[(1, batch_size)]
+                    lines.append(f"{batch_size}\t{throughput:.2f}\t\t{throughput/args.threads:.2f}")
+            else:
+                lines.append("size\tmessages/s")
+                for batch_size in batch_sizes:
+                    lines.append(f"{batch_size}\t{results[(1, batch_size)]:.2f}")
+
+        for line in lines:
+            print(line)
+
+        if args.save:
+            base_model_name = model_ids["torch"]["model_id"].split('/')[-1]
+            if args.device == 'gpu':
+                device_name = gpu_name.replace(' ', '-')
+            else:
+                device_name = f"cpu_{args.threads}t"
+            save_dir = f"results/{base_model_name}"
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = f"{save_dir}/{device_name}_{model_name_arg}_{args.dataset}.tsv"
+            with open(save_path, 'w') as f:
+                for line in lines:
+                    f.write(line + "\n")
+            print(f"\nResults saved to {save_path}")
